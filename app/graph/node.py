@@ -1,7 +1,16 @@
 from __future__ import annotations
 
 from app.schemas.state import GraphState
-from app.services.llm import llm_text
+from app.services.llm import (
+    llm_enhancer_prompt,
+    llm_summary,
+    llm_plan,
+    llm_divide_work,
+    llm_explain,
+    llm_simple,
+    llm_mail,
+    router_decision_llm,
+)
 from app.services.search import search_with_fallback
 from app.utils.helper import add_step, make_mailto_url, search_results_to_text
 
@@ -11,39 +20,67 @@ def _combined_text(state: GraphState) -> str:
     return f"{inp.get('messy_note', '')}\n{inp.get('what_to_do', '')}"
 
 
-def _infer_main_actions(text: str) -> list[str]:
-    text = text.lower()
-    actions: list[str] = []
+def _normalize_main_action(action: str) -> str:
+    action = action.lower().strip()
 
-    if any(k in text for k in ["summarize", "summary", "expand", "shorten"]):
-        actions.append("summarize")
+    mapping = {
+        "summary": "summarize",
+        "summarize": "summarize",
+        "brief": "summarize",
+        "short": "summarize",
+        "plan": "plan",
+        "schedule": "plan",
+        "timeline": "plan",
+        "roadmap": "plan",
+        "divide": "divide",
+        "divide work": "divide",
+        "assign": "divide",
+        "split": "divide",
+        "explain": "explain",
+        "explanation": "explain",
+        "external search": "resources",
+        "search": "resources",
+        "resources": "resources",
+        "simple answer": "simple_answer",
+        "simple_answer": "simple_answer",
+        "answer": "simple_answer",
+        "default": "simple_answer",
+    }
 
-    if any(k in text for k in ["plan", "deadline", "deadlines", "timeline", "schedule"]):
-        actions.append("plan")
-
-    if any(k in text for k in ["divide work", "assign", "split work", "distribution"]):
-        actions.append("divide")
-
-    if any(k in text for k in ["resource", "resources", "external", "reference", "references"]):
-        actions.append("resources")
-
-    if not actions:
-        actions.append("explain")
-
-    return list(dict.fromkeys(actions))
+    return mapping.get(action, "simple_answer")
 
 
-def _infer_post_actions(text: str) -> list[str]:
-    text = text.lower()
-    actions: list[str] = []
+def _normalize_post_action(action: str) -> str:
+    action = action.lower().strip()
 
-    if any(k in text for k in ["document", "txt", "file", "report", "pdf", "save note"]):
-        actions.append("document")
+    mapping = {
+        "document": "document",
+        "file": "document",
+        "report": "document",
+        "mail": "human_input",
+        "email": "human_input",
+        "human_input": "human_input",
+    }
 
-    if any(k in text for k in ["mail", "email", "gmail", "draft mail", "draft email", "send email", "send mail"]):
-        actions.append("human_input")
+    return mapping.get(action, "")
 
-    return list(dict.fromkeys(actions))
+
+def _clean_actions(actions: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for action in actions:
+        normalized = _normalize_main_action(action)
+        if normalized not in cleaned:
+            cleaned.append(normalized)
+    return cleaned
+
+
+def _clean_post_actions(actions: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for action in actions:
+        normalized = _normalize_post_action(action)
+        if normalized and normalized not in cleaned:
+            cleaned.append(normalized)
+    return cleaned
 
 
 def enhance_prompt(state: GraphState) -> GraphState:
@@ -62,19 +99,84 @@ User task:
 Return only the cleaned instruction.
 """.strip()
 
-    formatted = llm_text(prompt)
+    formatted = llm_enhancer_prompt(prompt)
     outputs = add_step(state.get("outputs"), "formatted_prompt", formatted, kind="text")
     return {"formatted_prompt": formatted, "outputs": outputs}
 
 
 def route_main(state: GraphState) -> GraphState:
-    actions = _infer_main_actions(_combined_text(state))
+    prompt = f"""
+You are a router for a meeting assistant.
+
+User note:
+{state['input_one'].get('messy_note', '')}
+
+User task:
+{state['input_one'].get('what_to_do', '')}
+
+Choose one or more actions from:
+- summarize
+- plan
+- divide
+- explain
+- resources
+- simple_answer
+
+Rules:
+- summarize = brief, short, summarize, brief the content, condense
+- plan = schedule, timeline, roadmap, deadline, planning
+- divide = assign work, split tasks, distribute work
+- explain = explanation, explain in simple words, clarify
+- resources = external search, references, sources, links
+- simple_answer = default when nothing else fits
+
+You may return more than one action if needed.
+Return only the keywords as a JSON list, like:
+["summarize", "resources"]
+
+If nothing matches, return:
+["simple_answer"]
+""".strip()
+
+    raw_actions = router_decision_llm(prompt)
+
+    if not raw_actions:
+        actions = ["simple_answer"]
+    else:
+        actions = _clean_actions(raw_actions)
+
+    if not actions:
+        actions = ["simple_answer"]
+
     outputs = add_step(state.get("outputs"), "main_router", actions, kind="text")
     return {"selected_actions": actions, "outputs": outputs}
 
 
 def route_post(state: GraphState) -> GraphState:
-    actions = _infer_post_actions(_combined_text(state))
+    prompt = f"""
+You are a router for post-processing actions.
+
+User note:
+{state['input_one'].get('messy_note', '')}
+
+User task:
+{state['input_one'].get('what_to_do', '')}
+
+Choose zero, one, or both actions from:
+- document
+- human_input
+
+Rules:
+- document = user wants file, report, txt, saved output
+- human_input = user wants email/mail drafting or approval step
+
+Return only a JSON list of keywords.
+If nothing is needed, return an empty list.
+""".strip()
+
+    raw_actions = router_decision_llm(prompt)
+    actions = _clean_post_actions(raw_actions)
+
     outputs = add_step(state.get("outputs"), "post_router", actions or ["end"], kind="text")
     return {"post_actions": actions, "outputs": outputs}
 
@@ -86,7 +188,7 @@ Summarize these meeting notes in simple bullet points:
 {state['input_one'].get('messy_note', '')}
 """.strip()
 
-    result = llm_text(prompt)
+    result = llm_summary(prompt)
     outputs = add_step(state.get("outputs"), "summary", result, kind="text")
     return {"outputs": outputs}
 
@@ -102,7 +204,7 @@ Task:
 {state['input_one'].get('what_to_do', '')}
 """.strip()
 
-    result = llm_text(prompt)
+    result = llm_plan(prompt)
     outputs = add_step(state.get("outputs"), "plan", result, kind="text")
     return {"outputs": outputs}
 
@@ -118,8 +220,40 @@ Task:
 {state['input_one'].get('what_to_do', '')}
 """.strip()
 
-    result = llm_text(prompt)
+    result = llm_divide_work(prompt)
     outputs = add_step(state.get("outputs"), "divide_work", result, kind="text")
+    return {"outputs": outputs}
+
+
+def explain_node(state: GraphState) -> GraphState:
+    prompt = f"""
+Explain the meeting outcome in clear simple words.
+
+Meeting notes:
+{state['input_one'].get('messy_note', '')}
+
+Task:
+{state['input_one'].get('what_to_do', '')}
+""".strip()
+
+    result = llm_explain(prompt)
+    outputs = add_step(state.get("outputs"), "explain", result, kind="text")
+    return {"outputs": outputs}
+
+
+def simple_answer_node(state: GraphState) -> GraphState:
+    prompt = f"""
+Give a simple direct answer to the user's request.
+
+Meeting notes:
+{state['input_one'].get('messy_note', '')}
+
+Task:
+{state['input_one'].get('what_to_do', '')}
+""".strip()
+
+    result = llm_simple(prompt)
+    outputs = add_step(state.get("outputs"), "simple_answer", result, kind="text")
     return {"outputs": outputs}
 
 
@@ -132,22 +266,6 @@ def resources_node(state: GraphState) -> GraphState:
     return {"search_results": results, "outputs": outputs}
 
 
-def explain_node(state: GraphState) -> GraphState:
-    prompt = f"""
-Explain the meeting outcome in clear bullet points.
-
-Meeting notes:
-{state['input_one'].get('messy_note', '')}
-
-Task:
-{state['input_one'].get('what_to_do', '')}
-""".strip()
-
-    result = llm_text(prompt)
-    outputs = add_step(state.get("outputs"), "explain", result, kind="text")
-    return {"outputs": outputs}
-
-
 def execute_main_actions(state: GraphState) -> GraphState:
     actions = state.get("selected_actions", [])
     outputs = state.get("outputs", [])
@@ -156,13 +274,14 @@ def execute_main_actions(state: GraphState) -> GraphState:
         "summarize": summarize_node,
         "plan": plan_node,
         "divide": divide_work_node,
-        "resources": resources_node,
         "explain": explain_node,
+        "resources": resources_node,
+        "simple_answer": simple_answer_node,
     }
 
     for action in actions:
         current_state = {**state, "outputs": outputs}
-        handler = handlers.get(action, explain_node)
+        handler = handlers.get(action, simple_answer_node)
         result = handler(current_state)
         outputs = result["outputs"]
         state = {**state, **result}
@@ -172,6 +291,7 @@ def execute_main_actions(state: GraphState) -> GraphState:
         "search_results": state.get("search_results", []),
         "formatted_prompt": state.get("formatted_prompt", ""),
     }
+
 
 def document_node(state: GraphState) -> GraphState:
     outputs = add_step(
@@ -187,7 +307,6 @@ def document_node(state: GraphState) -> GraphState:
         "document_url": None,
         "outputs": outputs,
     }
-
 
 
 def human_input_node(state: GraphState) -> GraphState:
@@ -213,7 +332,7 @@ Key points:
 Return only the email body.
 """.strip()
 
-    body = llm_text(prompt)
+    body = llm_mail(prompt)
     mail_url = make_mailto_url(recipient_email, subject, body)
 
     outputs = add_step(
@@ -261,3 +380,4 @@ def execute_post_actions(state: GraphState) -> GraphState:
         "mail_status": current_state.get("mail_status"),
         "mail_message": current_state.get("mail_message"),
     }
+
